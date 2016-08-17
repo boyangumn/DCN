@@ -488,9 +488,9 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
 
     """
 
-    datasets = load_all_data(dataset)  
+#    datasets = load_all_data(dataset)  
 
-#    datasets = load_data(dataset)  
+    datasets = load_data(dataset)  
 
 #    train_set_x, train_set_y = datasets[0]
 #    valid_set_x, valid_set_y = datasets[1]
