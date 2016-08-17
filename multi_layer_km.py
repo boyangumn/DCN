@@ -382,10 +382,18 @@ def load_all_data(dataset):
 #            break
     
 # use only two clusters in the testest
+    data_set = test_set
+    N = 4000
+    idx = numpy.logical_or((data_set[1] == 1 ),  (data_set[1] == 0 ))
+    idx = numpy.logical_or(idx, (data_set[1] == 2 ))    
+    idx = numpy.logical_or(idx, (data_set[1] == 3 ))
+        
     
-    idx = numpy.logical_or((test_set[1] == 1 ),  (test_set[1] == 0 ))
-    train_x = test_set[0][idx]
-    train_y = test_set[1][idx]
+    train_x = data_set[0][idx]
+    train_y = data_set[1][idx]
+    
+    train_x = train_x[0:N]
+    train_y = train_y[0:N]
     
     def shared_dataset(data_xy, borrow=True):
             """ Function that loads the dataset into shared variables
@@ -488,9 +496,9 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
 
     """
 
-#    datasets = load_all_data(dataset)  
+    datasets = load_all_data(dataset)  
 
-    datasets = load_data(dataset)  
+#    datasets = load_data(dataset)  
 
 #    train_set_x, train_set_y = datasets[0]
 #    valid_set_x, valid_set_y = datasets[1]
@@ -748,15 +756,15 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
     
 
 if __name__ == '__main__':      
-    params = {'lbd': 0.01,               
-              'pretraining_epochs': 10,
+    params = {'lbd': 0.005,               
+              'pretraining_epochs': 30,
               'pretrain_lr': .01, 
               'mu': 0.9,
-              'finetune_lr': 0.01, 
-              'training_epochs': 10,
+              'finetune_lr': 0.001, 
+              'training_epochs': 50,
               'dataset': 'mnist.pkl.gz', 
               'batch_size': 20, 
-              'nClass': 2, 
+              'nClass': 4, 
               'hidden_dim': [1000, 500, 250, 10]}
              
     test_SdC(**params)      
