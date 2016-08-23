@@ -23,7 +23,10 @@ from sklearn.metrics.pairwise import rbf_kernel
 from sklearn.decomposition import NMF
 
 
-f = gzip.open('/home/bo/Data/MNIST_array', 'rb')
+#f = gzip.open('/home/bo/Data/MNIST_array', 'rb')
+f = gzip.open('/home/yang4173/Data/MNIST_array', 'rb')
+# train_x_reduced means the zeros are taken out directely, resulting a 601 dimension vector for each image
+# There are in total 70000 images
 train_x, train_y, train_x_reduced = cPickle.load(f)
 f.close
 
@@ -39,7 +42,12 @@ A = kneighbors_graph(train_x, k)
 # NMF
 
 model = NMF(n_components = D)
+
+start_time = timeit.default_timer()
 W = model.fit_transform(A)
+end_time = timeit.default_timer()
+training_time = end_time - start_time
+print('The NMF algorithm runs for: %.4f min.' %(training_time/60.))
 
 sio.savemat('reduced', {'W': W, 'train_y': train_y})
 
