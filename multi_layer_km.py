@@ -28,10 +28,13 @@ import theano
 import theano.tensor as T
 import scipy.io as sio
 from theano.tensor.shared_randomstreams import RandomStreams
+from theano.ifelse import ifelse
+from cluster_acc import acc
+from mnist_loader import MNIST
  
 from sklearn import metrics
 from sklearn.cluster import MiniBatchKMeans
-#from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans
 
 import matplotlib.pyplot as plt
 from utils import tile_raster_images
@@ -58,17 +61,20 @@ def sigmoid(x):
     
 class dA2(dA):
     # overload the original function in dA class
+    # using the ReLU nonlinearity
     def __init__(
-            self,
-            numpy_rng,
-            theano_rng=None,
-            input=None,
-            n_visible=784,
-            n_hidden=500,
-            W=None,
-            bhid=None,
-            bvis=None
-        ):
+        self,
+        numpy_rng,
+        theano_rng=None,
+        input=None,
+        n_visible=784,
+        n_hidden=500,
+        W=None,
+        bhid=None,
+        bvis=None,
+        gamma = None,
+        beta = None
+    ):
         """
         Initialize the dA class by specifying the number of visible units (the
         dimension d of the input ), the number of hidden units ( the dimension
@@ -117,22 +123,22 @@ class dA2(dA):
         """
         self.n_visible = n_visible
         self.n_hidden = n_hidden
+#        self.gamma = theano.shared(value = numpy.ones((n_hidden,), 
+#                                                  dtype=theano.config.floatX), name='gamma')
+#        self.beta = theano.shared(value = numpy.zeros((n_hidden,), 
+#                                                dtype=theano.config.floatX), name='beta')
 
         # create a Theano random generator that gives symbolic random values
         if not theano_rng:
             theano_rng = RandomStreams(numpy_rng.randint(2 ** 30))
 
         # note : W' was written as `W_prime` and b' as `b_prime`
-        if not W:
+        if W is None:
             # W is initialized with `initial_W` which is uniformely sampled
             # from -4*sqrt(6./(n_visible+n_hidden)) and
             # 4*sqrt(6./(n_hidden+n_visible))the output of uniform if
             # converted using asarray to dtype
             # theano.config.floatX so that the code is runable on GPU
-            initial_W = numpy.asarray(
-                0.01*numpy.float32(numpy.random.randn(n_visible, n_hidden))               
-                
-            )
 #            initial_W = numpy.asarray(
 #                numpy_rng.uniform(
 #                    low=-4 * numpy.sqrt(6. / (n_hidden + n_visible)),
@@ -141,9 +147,15 @@ class dA2(dA):
 #                ),
 #                dtype=theano.config.floatX
 #            )
-            W = theano.shared(value=initial_W, name='W', borrow=True)
+            initial_W = numpy.asarray(
+                0.01*numpy.float32(numpy.random.randn(n_visible, n_hidden))               
+                
+            )
+        else:
+            initial_W = W            
+        W = theano.shared(value=initial_W, name='W', borrow=True)
 
-        if not bvis:
+        if bvis is None:
             bvis = theano.shared(
                 value=numpy.zeros(
                     n_visible,
@@ -151,8 +163,13 @@ class dA2(dA):
                 ),
                 borrow=True
             )
+        else:
+            bvis = theano.shared(
+                value=bvis,
+                borrow=True
+            )
 
-        if not bhid:
+        if bhid is None:
             bhid = theano.shared(
                 value=numpy.zeros(
                     n_hidden,
@@ -161,6 +178,22 @@ class dA2(dA):
                 name='b',
                 borrow=True
             )
+        else:
+            bhid = theano.shared(
+                value=bhid,
+                name='b',
+                borrow=True
+            )
+            
+        if gamma is None:
+            gamma = theano.shared(value = numpy.ones((n_hidden,), dtype=theano.config.floatX), name='gamma')
+        else:
+            gamma = theano.shared(value = gamma, name='gamma')
+                                    
+        if beta is None:
+            beta = theano.shared(value = numpy.zeros((n_hidden,),dtype=theano.config.floatX), name='beta')
+        else:
+            beta = theano.shared(value = beta, name='beta')
 
         self.W = W
         # b corresponds to the bias of the hidden
@@ -170,6 +203,8 @@ class dA2(dA):
         # tied weights, therefore W_prime is W transpose
         self.W_prime = self.W.T
         self.theano_rng = theano_rng
+        self.gamma = gamma
+        self.beta = beta
         # if no input is given, generate a variable representing the input
         if input is None:
             # we use a matrix because we expect a minibatch of several
@@ -178,9 +213,39 @@ class dA2(dA):
         else:
             self.x = input
 
-        self.params = [self.W, self.b, self.b_prime]
+#        self.gamma = theano.shared(value = numpy.ones((n_hidden,), dtype=theano.config.floatX), name='gamma')
+#        self.beta = theano.shared(value = numpy.zeros((n_hidden,), dtype=theano.config.floatX), name='beta')
+                
+        self.params = [self.W, self.b, self.b_prime, self.gamma, self.beta]
+        self.delta = [theano.shared(value = numpy.zeros((n_visible, n_hidden), dtype = theano.config.floatX), borrow=True), 
+                       theano.shared(value = numpy.zeros(n_hidden,  dtype = theano.config.floatX), borrow = True ),
+                        theano.shared(value = numpy.zeros(n_visible,  dtype = theano.config.floatX), borrow = True ),
+                        theano.shared(value = numpy.zeros(n_hidden,  dtype = theano.config.floatX), borrow = True ),
+                        theano.shared(value = numpy.zeros(n_hidden,  dtype = theano.config.floatX), borrow = True )
+                     ]
         
-    def get_cost_updates(self, corruption_level, learning_rate):
+#        self.linear = T.dot(input, self.W) + self.b
+#        self.bn_output = T.nnet.bn.batch_normalization(inputs = self.linear,
+#			gamma = self.gamma, beta = self.beta, mean = self.linear.mean((0,), keepdims=True),
+#			std = T.ones_like(self.linear.var((0,), keepdims = True)), mode='high_mem')
+        
+    def get_hidden_values(self, input):
+        """ Computes the values of the hidden layer """
+        
+        linear = T.dot(input, self.W) + self.b
+        bn_output = T.nnet.bn.batch_normalization(inputs = linear,
+			gamma = self.gamma, beta = self.beta, mean = linear.mean((0,), keepdims=True),
+			std = T.ones_like(linear.var((0,), keepdims = True)), mode='high_mem')
+   
+        return T.nnet.relu(bn_output)
+
+    def get_reconstructed_input(self, hidden):
+        """Computes the reconstructed input given the values of the
+        hidden layer
+
+        """
+        return T.nnet.relu(T.dot(hidden, self.W_prime) + self.b_prime)
+    def get_cost_updates(self, corruption_level, learning_rate, mu):
         """ This function computes the cost and the updates for one trainng
         step of the dA """
 
@@ -199,10 +264,19 @@ class dA2(dA):
         # to its parameters
         gparams = T.grad(cost, self.params)
         # generate the list of updates
-        updates = [
-            (param, param - learning_rate * gparam)
-            for param, gparam in zip(self.params, gparams)
-        ]
+        updates = []
+#        grad_values = []
+#        param_norm = []
+        for param, delta, gparam in zip(self.params, self.delta, gparams):
+            updates.append( (delta, mu*delta - learning_rate * gparam) )
+            updates.append( (param, param + mu*mu*delta - (1+mu)*learning_rate*gparam ))
+#            grad_values.append(gparam.norm(L=2))
+#            param_norm.append(param.norm(L=2))
+        
+#        updates = [
+#            (param, param - learning_rate * gparam)
+#            for param, gparam in zip(self.params, gparams)
+#        ]
 
         return (cost, updates)        
         
@@ -216,14 +290,17 @@ class SdC(object):
         input = None,
         n_ins=784,
         lbd = 1,
+        beta = 1,
         hidden_layers_sizes=[1000, 200, 10],
-        corruption_levels=[0, 0, 0]
+        corruption_levels=[0, 0, 0],
+        Param_init = None
     ):
 #        self.sigmoid_layers = []
         self.dA_layers = []
         self.params = []
         self.n_layers = len(hidden_layers_sizes)
         self.lbd = lbd
+        self.beta = beta
         self.delta = []   
     
         assert self.n_layers > 0
@@ -252,24 +329,28 @@ class SdC(object):
                 layer_input = self.x
             else:
                 layer_input = self.dA_layers[-1].get_hidden_values(self.dA_layers[-1].x)
-    
-            dA_layer = dA2(numpy_rng=numpy_rng,
-                          theano_rng=theano_rng,
-                          input=layer_input,
-                          n_visible=input_size,
-                          n_hidden=hidden_layers_sizes[i])
+            if Param_init is None:
+                dA_layer = dA2(numpy_rng=numpy_rng,
+                              theano_rng=theano_rng,
+                              input=layer_input,
+                              n_visible=input_size,
+                              n_hidden=hidden_layers_sizes[i])                
+            else:
+                dA_layer = dA2(numpy_rng=numpy_rng,
+                              theano_rng=theano_rng,
+                              input=layer_input,
+                              n_visible=input_size,
+                              n_hidden=hidden_layers_sizes[i],
+                              W = Param_init[5*i],
+                              bhid = Param_init[5*i + 1],
+                              bvis = Param_init[5*i+2],
+                              gamma = Param_init[5*i+3],
+                              beta = Param_init[5*i+4])                
+                          
             self.dA_layers.append(dA_layer)
-            self.params.extend(dA_layer.params)
-            delta_i = (theano.shared(value = numpy.zeros((input_size, hidden_layers_sizes[i]), dtype = numpy.float32), borrow=True), 
-                       theano.shared(value = numpy.zeros(hidden_layers_sizes[i],  dtype = numpy.float32), borrow = True ),
-                        theano.shared(value = numpy.zeros(input_size,  dtype = numpy.float32), borrow = True ) )
-                       
-            self.delta.extend(delta_i)
- 
-            
-            # construct a function that implements one step of finetunining
-            # compute the cost for second phase of training,
-            # defined as the negative log likelihood             
+            self.params.extend(dA_layer.params)                       
+            self.delta.extend(dA_layer.delta) 
+                      
     def get_output(self):        
 #        return self.sigmoid_layers[-1].output
         return self.dA_layers[-1].get_hidden_values(self.dA_layers[-1].x)
@@ -277,7 +358,7 @@ class SdC(object):
     def get_network_reconst(self):
         reconst = self.get_output()
         for da in reversed(self.dA_layers):
-            reconst = T.nnet.sigmoid(T.dot(reconst, da.W_prime) + da.b_prime)
+            reconst = T.nnet.relu(T.dot(reconst, da.W_prime) + da.b_prime)
             
         return reconst
         
@@ -295,10 +376,10 @@ class SdC(object):
         L =  T.sum(temp, axis=1) 
         # Add the network reconstruction error 
         z = self.get_network_reconst()
-#        reconst_err = T.sum(T.pow(self.x - z, 2), axis = 1)     
-        reconst_err = - T.sum(self.x * T.log(z) + (1 - self.x) * T.log(1 - z), axis=1)
+        reconst_err = T.sum(T.pow(self.x - z, 2), axis = 1)     
+#        reconst_err = - T.sum(self.x * T.log(z) + (1 - self.x) * T.log(1 - z), axis=1)
         
-        L = L + self.lbd*reconst_err
+        L = self.beta*L + self.lbd*reconst_err
         
         cost1 = T.mean(L)
         cost2 = self.lbd*T.mean(reconst_err)  
@@ -324,7 +405,7 @@ class SdC(object):
         return ((cost1, cost2, cost3, grad_, param_), updates)
         
         
-    def pretraining_functions(self, train_set_x, batch_size):
+    def pretraining_functions(self, train_set_x, batch_size, mu):
         ''' Generates a list of functions, each of them implementing one
         step in trainnig the dA corresponding to the layer with same index.
         The function will require as input the minibatch index, and to train
@@ -352,14 +433,18 @@ class SdC(object):
         # ending of a batch given `index`
         batch_end = batch_begin + batch_size
         
-        if T.gt(batch_end, train_set_x.shape[0]):
-            batch_end = train_set_x.shape[0]
+#        if T.gt(batch_end, train_set_x.shape[0]):
+#            batch_end = train_set_x.shape[0]
+#        a,b = T.scalars('a','b')      
+#        z_ifelse = ifelse(T.lt(a, b), a, b)
+#        end_ifelse = theano.function([a,b], z_ifelse, mode=theano.Mode(linker='vm'))
+#        batch_end = end_ifelse(batch_begin + batch_size, train_set_x.shape[0])
 
         pretrain_fns = []
         for dA in self.dA_layers:
             # get the cost and the updates list
             cost, updates = dA.get_cost_updates(corruption_level,
-                                                learning_rate)
+                                                learning_rate, mu)
             # compile the theano function
             fn = theano.function(
                 inputs=[
@@ -371,7 +456,8 @@ class SdC(object):
                 updates=updates,
                 givens={
                     self.x: train_set_x[batch_begin: batch_end]
-                }
+                },
+                on_unused_input='ignore'
             )
             # append `fn` to the list of functions
             pretrain_fns.append(fn)
@@ -421,15 +507,17 @@ class SdC(object):
         mu,
         learning_rate=learning_rate
         )
-
-        if T.le((index + 1) * batch_size, train_set_x.shape[0]):
-            minibatch = train_set_x[
+        minibatch = train_set_x[
                     index * batch_size: (index + 1) * batch_size
                 ]
-        else:
-            minibatch = minibatch = train_set_x[
-                    index * batch_size: -1
-                ]
+#        if T.le((index + 1) * batch_size, train_set_x.shape[0]):
+#            minibatch = train_set_x[
+#                    index * batch_size: (index + 1) * batch_size
+#                ]
+#        else:
+#            minibatch = minibatch = train_set_x[
+#                    index * batch_size: -1
+#                ]
         train_fn = theano.function(
             inputs=[index],
             outputs= cost,
@@ -441,11 +529,115 @@ class SdC(object):
         )
         return train_fn       
 
-# define a log function that does not give -inf when the argument is 0        
-def logg(x):
-    return numpy.log(x + 1e-30)
+def load_mnist(dataset, batch_size):
+#    datapath = '/home/bo/Data/infimnist/'
+#    path_img = datapath + 'mnist500k-images-idx1-ubyte'
+#    path_lbl = datapath + 'mnist500k-labels-idx1-ubyte'
+#    train_x, train_y = MNIST.load(path_img, path_lbl)
+    
+    with gzip.open(dataset, 'rb') as f:
+        train, test, valid = cPickle.load(f)
+    train_x = numpy.concatenate((train[0], test[0], valid[0]), axis = 0)
+    train_y = numpy.concatenate((train[1], test[1], valid[1]), axis = 0)
+    
+    N = train_x.shape[0] - train_x.shape[0] % batch_size
+    train_x = train_x[0: N]
+    train_y = train_y[0: N]
+    
+    data_x, data_y = shared_dataset((train_x, train_y))    
+    rval = [(data_x, data_y), 0, 0]
+    return rval   
 
-def load_all_data(dataset):
+def load_rcv(dataset, batch_size):    
+    with gzip.open(dataset, 'rb') as f:
+        data = cPickle.load(f)
+    
+    train_x = numpy.float32(data[0].toarray())
+    train_x = train_x.astype(numpy.float32)
+    train_y = numpy.asarray(data[1], dtype = numpy.int32)
+    train_y = numpy.reshape(train_y, (train_y.shape[0], 1))
+    
+    # take out the largest cluster, it is too large, imbalance.
+#    ind = numpy.squeeze(train_y != 4)
+#    train_x = train_x[ind]
+#    train_y = train_y[ind]
+    # shuffle the data
+#    dim = train_x.shape[1]
+#    data = numpy.concatenate((train_x, train_y), axis = 1)
+#    numpy.random.shuffle(data)    
+    # Top-4: take only the first 178600 data sample
+    # Top-8: take only the first 267400 data sample
+    N = train_x.shape[0] - train_x.shape[0] % batch_size
+    train_x = train_x[0:N]
+    train_y = train_y[0:N]
+    idx = numpy.random.permutation(N)
+    train_x = train_x[idx]
+    train_y = train_y[idx]
+        
+#    train_x = data[0: N][:, 0:dim]
+#    train_y = numpy.int32(numpy.squeeze(data[0: N][:, -1]))  
+    
+    data_x, data_y = shared_dataset((train_x, train_y))
+    
+    rval = [(data_x, data_y), 0, 0]
+    return rval
+
+def load_pendigits(dataset, batch_size):
+    with gzip.open(dataset, 'rb') as f:
+        data = cPickle.load(f)
+        
+    train_x = data[0].astype(numpy.float32)
+    train_y = data[1]
+    N = train_x.shape[0] - train_x.shape[0] % batch_size
+    train_x = train_x[0:N]
+    train_y = train_y[0:N]
+    
+    data_x, data_y = shared_dataset((train_x, train_y))
+    
+    rval = [(data_x, data_y), 0, 0]
+    return rval  
+
+def load_ssc(dataset, batch_size):
+    data = sio.loadmat(dataset)
+#    train_x = (data['train_x'].T).astype(numpy.float32)
+#    train_y = numpy.squeeze(data['train_y'])
+    train_x = data['kerN'].astype(numpy.float32)
+    train_y = numpy.squeeze(data['MNIST_LABEL'])
+    Nt = train_x.shape[0]
+    N = Nt- numpy.mod(Nt, batch_size)    
+    train_x = train_x[0:N]
+    train_y = train_y[0:N]
+    
+    # normalize 
+    train_x = train_x - numpy.min(train_x)
+    train_x = train_x/numpy.max(train_x)
+    
+    data_x, data_y = shared_dataset((train_x, train_y))
+    # The value 0 won't be used, just use as a placeholder
+    rval = [(data_x, data_y), 0, 0]
+    return rval
+    
+def load_20(dataset, batch_size):
+    data = sio.loadmat(dataset)
+    train_x = (data['fea_t'].toarray()).astype(numpy.float32)
+    train_y = numpy.squeeze(data['gnd'].astype(numpy.int32))
+    Nt = train_x.shape[0]
+    N = Nt - numpy.mod(Nt, batch_size)    
+    train_x = train_x[0:N]
+    train_x = train_x/numpy.max(train_x)
+    train_y = train_y[0:N]
+    
+    # shuffle
+    idx = numpy.random.choice(N, size = N, replace = False)
+    train_x = train_x[idx]
+    train_y = train_y[idx]
+    
+    data_x, data_y = shared_dataset((train_x, train_y))
+    # The value 0 won't be used, just use as a placeholder
+    rval = [(data_x, data_y), 0, 0]
+    return rval
+    
+def load_all_data(dataset, batch_size):
     ''' Loads the dataset
 
     :type dataset: string
@@ -476,20 +668,15 @@ def load_all_data(dataset):
         urllib.urlretrieve(origin, dataset)
 
     print '... loading data'
-#    loaded_data = sio.loadmat('V')
-#    train_x = loaded_data['train_x']
-#    train_x = numpy.float32(train_x)    
-#    train_y = numpy.squeeze(loaded_data['train_y'])
+    loaded_data = sio.loadmat(dataset)
+    train_x = loaded_data['train_x']
+    train_x = numpy.float32(train_x).T    
+    train_y = numpy.squeeze(loaded_data['train_y'])
 
     # Load the dataset
-    f = gzip.open(dataset, 'rb')
-    train_set, valid_set, test_set = cPickle.load(f)
-    f.close
-# K-means clustering 
-#    f = gzip.open('preprocessed_mnist_nmf.pkl.gz', 'rb')
-#    train_x, train_y = cPickle.load(f)
-#    f.close()
-#    train_y = train_set[1]
+#    f = gzip.open(dataset, 'rb')
+#    train_set, valid_set, test_set = cPickle.load(f)
+#    f.close
 #    train_x = numpy.concatenate((train_set[0], test_set[0], valid_set[0]), axis = 0)   
 #    train_y = numpy.concatenate((train_set[1], test_set[1], valid_set[1]), axis = 0)   
 #    train_x = train_x[:][:, 49:650]
@@ -511,37 +698,30 @@ def load_all_data(dataset):
     idx = numpy.logical_or(idx, (data_set[1] == 3 ))
         
     
-    train_x = data_set[0][idx]
-    train_y = data_set[1][idx]
+#    data_set = test_set
+#    N = 4000
+#    idx = numpy.logical_or((data_set[1] == 1 ),  (data_set[1] == 0 ))
+#    idx = numpy.logical_or(idx, (data_set[1] == 2 ))    
+#    idx = numpy.logical_or(idx, (data_set[1] == 3 ))
+#        
+#    
+#    train_x = data_set[0][idx]
+#    train_y = data_set[1][idx]
     
+    N = 70000 - numpy.mod(70000, batch_size)    
     train_x = train_x[0:N]
+#    train_x -= numpy.mean(train_x, axis = 0)
     train_y = train_y[0:N]
     
-    def shared_dataset(data_xy, borrow=True):
-            """ Function that loads the dataset into shared variables
-    
-            The reason we store our dataset in shared variables is to allow
-            Theano to copy it into the GPU memory (when code is run on GPU).
-            Since copying data into the GPU is slow, copying a minibatch everytime
-            is needed (the default behaviour if the data is not in a shared
-            variable) would lead to a large decrease in performance.
-            """
-            data_x, data_y = data_xy
-            shared_x = theano.shared(numpy.asarray(data_x,
-                                                   dtype=theano.config.floatX),
-                                     borrow=borrow)
-            shared_y = theano.shared(numpy.asarray(data_y,
-                                                   dtype=theano.config.floatX),
-                                     borrow=borrow)
-            # When storing data on the GPU it has to be stored as floats
-            # therefore we will store the labels as ``floatX`` as well
-            # (``shared_y`` does exactly that). But during our computations
-            # we need them as ints (we use labels as index, and if they are
-            # floats it doesn't make sense) therefore instead of returning
-            # ``shared_y`` we will have to cast it to int. This little hack
-            # lets ous get around this issue
-            #return shared_x, T.cast(shared_y, 'int32')
-            return shared_x, shared_y
+    # save a copy to perform SC
+#    f = gzip.open('mnist-n4000.pkl.gz','wb')
+#    cPickle.dump([train_x, train_y], f, protocol=2)
+#    f.close()
+#    train_x = 4*train_set[0]
+#    # normalize
+#    train_x = train_x/(numpy.linalg.norm(train_x, ord = 2, axis = 1, keepdims = True) + 1e-10)
+#    train_x = 4*train_x
+#    train_y = train_set[1]
             
     data_x, data_y = shared_dataset((train_x, train_y))
     
@@ -553,12 +733,37 @@ def load_all_data(dataset):
     # The value 0 won't be used, just use as a placeholder
     rval = [(data_x, data_y), 0, 0]
     return rval
-        
+    
+def shared_dataset(data_xy, borrow=True):
+        """ Function that loads the dataset into shared variables
+
+        The reason we store our dataset in shared variables is to allow
+        Theano to copy it into the GPU memory (when code is run on GPU).
+        Since copying data into the GPU is slow, copying a minibatch everytime
+        is needed (the default behaviour if the data is not in a shared
+        variable) would lead to a large decrease in performance.
+        """
+        data_x, data_y = data_xy
+        shared_x = theano.shared(numpy.asarray(data_x,
+                                               dtype=theano.config.floatX),
+                                 borrow=borrow)
+        shared_y = theano.shared(numpy.asarray(data_y,
+                                               dtype=theano.config.floatX),
+                                 borrow=borrow)
+        # When storing data on the GPU it has to be stored as floats
+        # therefore we will store the labels as ``floatX`` as well
+        # (``shared_y`` does exactly that). But during our computations
+        # we need them as ints (we use labels as index, and if they are
+        # floats it doesn't make sense) therefore instead of returning
+        # ``shared_y`` we will have to cast it to int. This little hack
+        # lets ous get around this issue
+        #return shared_x, T.cast(shared_y, 'int32')
+        return shared_x, shared_y        
 def batch_km(data, center, count):
     """
     Function to perform a KMeans update on a batch of data, center is the centroid 
     from last iteration.
-    
+
     """
     N = data.shape[0]
     K = center.shape[0]   
@@ -569,7 +774,8 @@ def batch_km(data, center, count):
         dist = numpy.inf
         ind = 0
         for j in range(K):
-            temp_dist = numpy.linalg.norm(data[i] - center[j])            
+            temp_dist = numpy.linalg.norm(data[i] - center[j])  
+#            temp_dist = 1 - numpy.dot(data[i], center[j])/(numpy.linalg.norm(data[i]) * numpy.linalg.norm(center[j]))
 #            temp_dist = -numpy.mean(data[i]*logg(center[j]) + (1 - data[i]) * logg(1 - center[j]))
             
             if temp_dist < dist:
@@ -587,10 +793,15 @@ def batch_km(data, center, count):
         center_new[c] = (1 - eta) * center_new[c] + eta * data[i]
         
     return idx, center_new, count
+    
+def load_config(saved_file):
+    with gzip.open(saved_file, 'rb') as f:
+        saved_result = cPickle.load(f)
+    return saved_result['config']
         
-def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
+def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', beta = 1, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
              pretrain_lr=.001, training_epochs=150,
-             dataset='toy.pkl.gz', batch_size=20, nClass = 4, hidden_dim = [100, 50, 2]):
+             dataset='toy.pkl.gz', batch_size=20, nClass = 4, hidden_dim = [100, 50, 2], load_dataset = load_data, diminishing = True):
     """
     Demonstrates how to train and test a stochastic denoising autoencoder.
 
@@ -617,15 +828,19 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
     :param dataset: path the the pickled dataset
 
     """
-
-    datasets = load_all_data(dataset)  
+    
+#    datasets = load_20(dataset, batch_size)
+#    datasets = load_ssc(dataset, batch_size)
+#    datasets = load_mnist(dataset, batch_size)   
+#    datasets = load_pendigits(dataset, batch_size)
+    
+#    datasets = load_rcv(dataset, batch_size)
+#    datasets = load_all_data(dataset, batch_size)  
 
 #    datasets = load_data(dataset)  
-
-#    train_set_x, train_set_y = datasets[0]
-#    valid_set_x, valid_set_y = datasets[1]
-#    test_set_x,  test_set_y  = datasets[2]
-
+    datasets = load_dataset(dataset, batch_size)
+    
+    working_dir = os.getcwd()
     train_set_x,  train_set_y  = datasets[0]
     
     inDim = train_set_x.get_value().shape[1]
@@ -637,74 +852,117 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
 #    x.tag.test_value = numpy.random.rand(50000, 784).astype('float32')
     
     # compute number of minibatches for training, validation and testing
-    n_train_batches = train_set_x.get_value(borrow=True).shape[0]
+    n_train_samples = train_set_x.get_value(borrow=True).shape[0]
+    n_train_batches = n_train_samples
     n_train_batches /= batch_size
 
     # numpy random generator
     # start-snippet-3
     numpy_rng = numpy.random.RandomState(89677)
+#    numpy_rng = numpy.random.RandomState()
     print '... building the model'
+    os.chdir(output_dir)
     # construct the stacked denoising autoencoder class
-    sdc = SdC(
-        numpy_rng=numpy_rng,
-        n_ins=inDim,
-        lbd = lbd, 
-        input=x,
-        hidden_layers_sizes= hidden_dim,
-    )
+    if Init == '':
+        sdc = SdC(
+            numpy_rng=numpy_rng,
+            n_ins=inDim,
+            lbd = lbd, 
+            beta = beta,
+            input=x,
+            hidden_layers_sizes= hidden_dim
+        )
+    else:
+        try:
+            with gzip.open(Init, 'rb') as f:
+                saved_params = cPickle.load(f)['network']
+            sdc = SdC(
+                    numpy_rng=numpy_rng,
+                    n_ins=inDim,
+                    lbd = lbd, 
+                    beta = beta,
+                    input=x,
+                    hidden_layers_sizes= hidden_dim,
+                    Param_init = saved_params
+                )
+            print '... loading saved network succeeded'
+        except IOError:
+            print >> sys.stderr, ('Cannot find the specified saved network, using random initializations.')
+            sdc = SdC(
+                    numpy_rng=numpy_rng,
+                    n_ins=inDim,
+                    lbd = lbd, 
+                    beta = beta,
+                    input=x,
+                    hidden_layers_sizes= hidden_dim
+                )           
+        
     # end-snippet-3 start-snippet-4
     #########################
     # PRETRAINING THE MODEL #
     #########################
-    print '... getting the pretraining functions'
-    pretraining_fns = sdc.pretraining_functions(train_set_x=train_set_x,
-                                                batch_size=batch_size)
+    if pretraining_epochs == 0 or Init != '':
+        print '... skipping pretraining'
+    else:       
+        print '... getting the pretraining functions'
+        pretraining_fns = sdc.pretraining_functions(train_set_x=train_set_x,
+                                                    batch_size=batch_size, mu = mu)
 
-    print '... pre-training the model'
-    start_time = timeit.default_timer()
-    ## Pre-train layer-wise
-    corruption_levels = [0, 0, 0, 0, 0]
-    
-    pretrain_lr_shared = theano.shared(numpy.asarray(pretrain_lr,
-                                                   dtype='float32'),
-                                     borrow=True)
-    for i in xrange(sdc.n_layers):
-        # go through pretraining epochs
-        iter = 0
-        for epoch in xrange(pretraining_epochs):
-            # go through the training set  
-            c = []  
-            for batch_index in xrange(n_train_batches):
-                iter = (epoch) * n_train_batches + batch_index 
-                pretrain_lr_shared.set_value( numpy.float32(pretrain_lr) )
-#                pretrain_lr_shared.set_value( numpy.float32(pretrain_lr/numpy.sqrt(iter + 1)) )
-                cost = pretraining_fns[i](index=batch_index,
-                         corruption=corruption_levels[i],
-                         lr=pretrain_lr_shared.get_value())                         
-                c.append(cost)
-                
-            print 'Pre-training layer %i, epoch %d, cost ' % (i, epoch),
-            print numpy.mean(c)
+        print '... pre-training the model'
+        start_time = timeit.default_timer()
+        ## Pre-train layer-wise
+        corruption_levels = 0*numpy.ones(len(hidden_dim), dtype = numpy.float32)
+        
+        pretrain_lr_shared = theano.shared(numpy.asarray(pretrain_lr,
+                                                       dtype='float32'),
+                                         borrow=True)
+        for i in xrange(sdc.n_layers):
+            # go through pretraining epochs
+            iter = 0
+            for epoch in xrange(pretraining_epochs):
+                # go through the training set  
+                c = []  
+                for batch_index in xrange(n_train_batches):
+                    iter = (epoch) * n_train_batches + batch_index 
+                    pretrain_lr_shared.set_value( numpy.float32(pretrain_lr) )
+    #                pretrain_lr_shared.set_value( numpy.float32(pretrain_lr/numpy.sqrt(iter + 1)) )
+                    cost = pretraining_fns[i](index=batch_index,
+                             corruption=corruption_levels[i],
+                             lr=pretrain_lr_shared.get_value())                         
+                    c.append(cost)
+                    
+                print 'Pre-training layer %i, epoch %d, cost ' % (i, epoch),
+                print numpy.mean(c)
 
-    end_time = timeit.default_timer()
+        end_time = timeit.default_timer()
 
-    print >> sys.stderr, ('The pretraining code for file ' +
-                          os.path.split(__file__)[1] +
-                          ' ran for %.2fm' % ((end_time - start_time) / 60.))
+        print >> sys.stderr, ('The pretraining code for file ' +
+                              os.path.split(__file__)[1] +
+                              ' ran for %.2fm' % ((end_time - start_time) / 60.))
+        
+        network = [param.get_value() for param in sdc.params]    
+        package = {'network': network}            
+        with gzip.open('deepclus_'+str(nClass)+ '_pretrain.pkl.gz', 'wb') as f:
+            cPickle.dump(package, f, protocol=cPickle.HIGHEST_PROTOCOL)
     # end-snippet-4
     ########################
     # FINETUNING THE MODEL #
     ########################
-
     
-    km = MiniBatchKMeans(n_clusters = nClass, batch_size=100)   
+    
+    km = KMeans(n_clusters = nClass)   
     
     out = sdc.get_output()
     out_sdc = theano.function(
         [index],
         outputs = out,
         givens = {x: train_set_x[index * batch_size: (index + 1) * batch_size]}
-    )    
+    )  
+    out_single = theano.function(
+        [index],
+        outputs = out,
+        givens = {x: train_set_x[index].reshape((1, inDim))}
+    ) 
     hidden_val = [] 
     for batch_index in xrange(n_train_batches):
          hidden_val.append(out_sdc(batch_index))
@@ -714,22 +972,55 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
     hidden_array = numpy.reshape(hidden_array, (hidden_size[0] * hidden_size[1], hidden_size[2] ))
       
     # use the true labels to get initial cluster centers
-    centers = numpy.zeros((nClass, hidden_size[2]), dtype = numpy.float32)
+#    centers = numpy.zeros((nClass, hidden_size[2]), dtype = numpy.float32)
+    hidden_zero = numpy.zeros_like(hidden_array)
     
-          
+    zeros_count = numpy.sum(numpy.equal(hidden_array, hidden_zero), axis = 0)       
     
 #    center_array = centers[label_true]
 #    # Do a k-means clusering to get center_array  
     km_idx = km.fit_predict(hidden_array)
-    for i in xrange(nClass):
-        temp = hidden_array[km_idx == i]        
-        centers[i] = numpy.mean(temp, axis = 0)
+    centers = km.cluster_centers_.astype(numpy.float32)
+#    for i in xrange(nClass):
+#        temp = hidden_array[km_idx == i]        
+#        centers[i] = numpy.mean(temp, axis = 0)
 #    center_array = km.cluster_centers_[[km.labels_]]             
     center_shared =  theano.shared(numpy.zeros((batch_size, hidden_dim[-1]) ,
                                                    dtype='float32'),
                                      borrow=True)
-    nmi_dc = metrics.adjusted_mutual_info_score(label_true, km_idx)
-    print >> sys.stderr, ('Initial NMI for deep clustering: %.2f' % (nmi_dc))
+    nmi = metrics.normalized_mutual_info_score(label_true, km_idx)
+    print >> sys.stderr, ('Initial NMI for deep clustering: %.2f' % (nmi))
+    
+    ari = metrics.adjusted_rand_score(label_true, km_idx)
+    print >> sys.stderr, ('ARI for deep clustering: %.2f' % (ari))
+    
+    try:
+        ac = acc(km_idx, label_true)
+    except AssertionError:
+        ac = 0
+        print('Number of predicted cluster mismatch with ground truth.')
+        
+    print >> sys.stderr, ('ACC for deep clustering: %.2f' % (ac))
+    
+    # Plot the initialization    
+#    color = ['b', 'g', 'r', 'm', 'k', 'b', 'g', 'r', 'm', 'k']
+#    marker = ['o', '+','o', '+','o', '+','o', '+','o', '+']
+#    data_to_plot = hidden_array[0:1999]
+#    label_plot = label_true[0:1999]   
+#    labels = numpy.unique(label_true)
+#    
+#    x = data_to_plot[:, 0]
+#    y = data_to_plot[:, 1]
+#    
+#    for i in xrange(nClass):
+#        idx_x = x[numpy.nonzero(label_plot == labels[i])]
+#        idx_y = y[numpy.nonzero(label_plot == labels[i])]   
+#        plt.figure(0)
+#        plt.scatter(idx_x, idx_y, s = 70, c = color[i], marker = marker[i], label = '%s'%i)
+#    
+#    plt.legend()
+#    plt.show() 
+    
 #    km_idx = label_true                                     
     lr_shared = theano.shared(numpy.asarray(finetune_lr,
                                                    dtype='float32'),
@@ -752,6 +1043,9 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
     done_looping = False
     epoch = 0
     
+    res_metrics = numpy.zeros((training_epochs/5 + 1, 3), dtype = numpy.float32)
+    res_metrics[0] = numpy.array([nmi, ari, ac])
+    
     count = 100*numpy.ones(nClass, dtype = numpy.int)
     while (epoch < training_epochs) and (not done_looping):
         epoch = epoch + 1    
@@ -760,6 +1054,9 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
         e = [] # cost of clustering 
         f = [] # learning_rate
         g = []
+        # count the number of assigned  data sample
+        # perform random initialization of centroid if empty cluster happens
+        count_samples = numpy.zeros((nClass)) 
         for minibatch_index in xrange(n_train_batches):
             # calculate the stepsize
             iter = (epoch - 1) * n_train_batches + minibatch_index 
@@ -770,6 +1067,8 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
             hidden_val = out_sdc(minibatch_index) # get the hidden value, to update KM
             # Perform mini-batch KM
             temp_idx, centers, count = batch_km(hidden_val, centers, count)
+#            for i in range(nClass):
+#                count_samples[i] += temp_idx.shape[0] - numpy.count_nonzero(temp_idx - i)             
 #            center_shared.set_value(numpy.float32(temp_center))
             km_idx[minibatch_index * batch_size: (minibatch_index +1 ) * batch_size] = temp_idx
             aa = sdc.dA_layers[0].W.get_value()
@@ -778,32 +1077,33 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
             e.append(cost[2])
             f.append(cost[3])
             g.append(cost[4])
-            # the index [()] is due to numpy peculiarity, what a nightmare....
-            if minibatch_index == n_train_batches -1 :
-                for p in f[-1]:
-                    print p
-                for p in g[-1]:
-                    print p
-                zz = 1
-            
-        # Do a k-means clusering to get center_array    
-#        hidden_val = [] 
-#        for batch_index in xrange(n_train_batches):
-#             hidden_val.append(out_sdc(batch_index))
-#        
-#        hidden_array  = numpy.asarray(hidden_val)
-#        hidden_size = hidden_array.shape        
-#        hidden_array = numpy.reshape(hidden_array, (hidden_size[0] * hidden_size[1], hidden_size[2] ))
-#        km.fit(hidden_array)
-#        center_array = km.cluster_centers_[[km.labels_]]   
-#        center_shared.set_value(numpy.asarray(center_array, dtype='float32'))          
-#        center_shared =  theano.shared(numpy.asarray(center_array ,
-#                                                       dtype='float32'),
-#                                         borrow=True)   
+
+        # check if empty cluster happen, if it does random initialize it
+#        for i in range(nClass):
+#            if count_samples[i] == 0:
+#                rand_idx = numpy.random.randint(low = 0, high = n_train_samples)
+#                # modify the centroid
+#                centers[i] = out_single(rand_idx)                
+        
         print 'Fine-tuning epoch %d ++++ \n' % (epoch), 
         print ('Total cost: %.5f, '%(numpy.mean(c)) + 'Reconstruction: %.5f, ' %(numpy.mean(d)) 
             + "Clustering: %.5f, " %(numpy.mean(e)) )
 #        print 'Learning rate: %.6f' %numpy.mean(f)
+        
+        # half the learning rate every 5 epochs
+        if epoch % 10 == 0 and diminishing == True:
+            finetune_lr /= 2
+            
+#         evaluate the clustering performance every 5 epoches      
+        if epoch % 5 == 0:            
+            nmi = metrics.normalized_mutual_info_score(label_true, km_idx)                
+            ari = metrics.adjusted_rand_score(label_true, km_idx)                
+            try:
+                ac = acc(km_idx, label_true)
+            except AssertionError:
+                ac = 0
+                print('Number of predicted cluster mismatch with ground truth.')    
+            res_metrics[epoch/5] = numpy.array([nmi, ari, ac])
 
     # get the hidden values, to make a plot
     hidden_val = [] 
@@ -812,17 +1112,25 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
     hidden_array  = numpy.asarray(hidden_val)
     hidden_size = hidden_array.shape        
     hidden_array = numpy.reshape(hidden_array, (hidden_size[0] * hidden_size[1], hidden_size[2] ))
-    
-    
+        
     err = numpy.mean(d)
     print >> sys.stderr, ('Average squared 2-D reconstruction error: %.4f' %err)
     end_time = timeit.default_timer()
     ypred = km_idx
-    nmi = metrics.adjusted_mutual_info_score(label_true, ypred)
+    
+    nmi = metrics.normalized_mutual_info_score(label_true, ypred)
     print >> sys.stderr, ('NMI for deep clustering: %.2f' % (nmi))
 
     ari = metrics.adjusted_rand_score(label_true, ypred)
     print >> sys.stderr, ('ARI for deep clustering: %.2f' % (ari))
+    
+    try:
+        ac = acc(ypred, label_true)
+    except AssertionError:
+        ac = 0
+        print('Number of predicted cluster mismatch with ground truth.')
+        
+    print >> sys.stderr, ('ACC for deep clustering: %.2f' % (ac))
 #    print(
 #        (
 #            'Optimization complete with best validation score of %f %%, '
@@ -832,63 +1140,143 @@ def test_SdC(lbd = .01, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
 #        % (best_validation_loss * 100., best_iter + 1, test_score * 100.)
 #    )
     
-    f = open('deepclus.save', 'wb')
-    cPickle.dump([param.get_value() for param in sdc.params], f, protocol=cPickle.HIGHEST_PROTOCOL)
-    f.close()
+    
+    
+    config = {'lbd': lbd,   
+              'beta': beta,
+              'pretraining_epochs': pretraining_epochs,
+              'pretrain_lr': pretrain_lr, 
+              'mu': mu,
+              'finetune_lr': finetune_lr, 
+              'training_epochs': training_epochs,
+              'dataset': dataset, 
+              'batch_size': batch_size, 
+              'nClass': nClass, 
+              'hidden_dim': hidden_dim}
+    results = {'result': res_metrics}
+    network = [param.get_value() for param in sdc.params]
+    
+    package = {'config': config,
+               'results': results,
+               'network': network}
+    with gzip.open(save_file, 'wb') as f:          
+        cPickle.dump(package, f, protocol=cPickle.HIGHEST_PROTOCOL)
+        
+    os.chdir(working_dir)    
     print >> sys.stderr, ('The training code for file ' +
                           os.path.split(__file__)[1] +
                           ' ran for %.2fm' % ((end_time - start_time) / 60.))
-    color = ['b', 'g', 'r', 'm', 'k', 'b', 'g', 'r', 'm', 'k']
-    marker = ['o', '+','o', '+','o', '+','o', '+','o', '+']
+#    color = ['b', 'g', 'r', 'm', 'k', 'b', 'g', 'r', 'm', 'k']
+#    marker = ['o', '+','o', '+','o', '+','o', '+','o', '+']
+#    
+#    #Take 500 samples to plot
+#    data_to_plot = hidden_array[0:1999]
+#    label_plot = label_true[0:1999]   
+#    labels = numpy.unique(label_true)
+#    
+#    x = data_to_plot[:, 0]
+#    y = data_to_plot[:, 1]
+#    
+#    for i in xrange(nClass):
+#        idx_x = x[numpy.nonzero(label_plot == labels[i])]
+#        idx_y = y[numpy.nonzero(label_plot == labels[i])]   
+#        plt.figure(1)
+#        plt.scatter(idx_x, idx_y, s = 70, c = color[i], marker = marker[i], label = '%s'%i)
+#    
+#    plt.legend()
+#    plt.show() 
     
-    #Take 500 samples to plot
-    data_to_plot = hidden_array[0:1999]
-    label_plot = label_true[0:1999]   
     
-    x = data_to_plot[:, 0]
-    y = data_to_plot[:, 1]
-    
-    for i in xrange(nClass):
-        idx_x = x[numpy.nonzero(label_plot == i)]
-        idx_y = y[numpy.nonzero(label_plot == i)]   
-        plt.figure(3)
-        plt.scatter(idx_x, idx_y, s = 70, c = color[i], marker = marker[i], label = '%s'%i)
-    
-    plt.legend()
-    plt.show() 
-    
-    return nmi, ari
-
-  
-#    if dataset == 'toy.pkl.gz':
-#        x = train_set_x.get_value()[:, 0]
-#        y = train_set_x.get_value()[:, 1]
-#        
-#        # using resulted label, and the original data
-#        pred_label = ypred[0:1999]
-#        for i in xrange(nClass):
-#            idx_x = x[numpy.nonzero( pred_label == i)]
-#            idx_y = y[numpy.nonzero( pred_label == i)]   
-#            plt.figure(4)
-#            plt.scatter(idx_x, idx_y, s = 70, c = color[i], marker = marker[i], label = '%s'%i)
-#        
-#        plt.legend()
-#        plt.show() 
-           
+    return res_metrics          
     
 
 if __name__ == '__main__':      
-    params = {'lbd': 0.005,               
-              'pretraining_epochs': 30,
+    result = numpy.zeros((5, 3), dtype = numpy.float32)
+
+
+##   for RCV1    
+#    i = 0
+#    filename = 'data-'+str(i)+'.pkl.gz'
+#    K = (i+1)*4
+#    path = '/home/bo/Data/RCV1/Processed/'
+
+##  for MNSIT dataset
+    K = 10
+    filename = 'mnist.pkl.gz'
+    path = '/home/bo/Data/MNIST/'
+
+
+## for SSC_data
+#    K = 10
+#    filename = 'ssc_sc.mat'
+#    path = ''
+
+
+## for 20-newsgroup
+#    K = 20
+#    filename = 'News_ncw.mat'
+#    path  = ''
+
+## for PenDigits
+#    K = 10
+#    filename = 'pendigits.pkl.gz'
+#    path = ''
+    
+    # deepclus_12_clusters.pkl.gz
+    # deepclus_20_pretrain.pkl.gz
+    trials = 1
+    dataset = path+filename
+    config = {'Init': '',
+              'lbd': .5, 
+              'beta': 1, 
+              'output_dir': 'Pendigits',
+              'save_file': 'pen_10.pkl.gz',
+              'pretraining_epochs': 50,
               'pretrain_lr': .005, 
               'mu': 0.9,
-              'finetune_lr': 0.001, 
+              'finetune_lr': 0.01, 
               'training_epochs': 50,
-              'dataset': 'mnist.pkl.gz', 
+              'dataset': dataset, 
               'batch_size': 20, 
-              'nClass': 4, 
-              'hidden_dim': [1000]}
-             
-    test_SdC(**params)      
+              'nClass': K, 
+              'hidden_dim': [50, 16, 16],
+              'load_data': load_mnist}
+    # load saved configuration          
+    saved_path = './MNIST_results/Finalized/'
+    saved_file = 'deepclus_10_clusters.pkl.gz'
+    saved_config = load_config(saved_path + saved_file)
+    for key, val in saved_config.iteritems():
+        config[key] = saved_config[key]
     
+    results = []
+    for i in range(trials):         
+        res_metrics = test_SdC(**config)   
+        results.append(res_metrics)
+        
+    results_SAEKM = numpy.zeros((trials, 3)) 
+    results_DCN   = numpy.zeros((trials, 3))
+
+    N = config['training_epochs']/5
+    for i in range(trials):
+        results_SAEKM[i] = results[i][0]
+        results_DCN[i] = results[i][N]
+    SAEKM_mean = numpy.mean(results_SAEKM, axis = 0)    
+    SAEKM_std  = numpy.std(results_SAEKM, axis = 0)    
+    DCN_mean   = numpy.mean(results_DCN, axis = 0)
+    DCN_std    = numpy.std(results_DCN, axis = 0)
+    print >> sys.stderr, ('SAE+KM avg. NMI = {0:.2f}, ARI = {1:.2f}, ACC = {2:.2f}'.format(SAEKM_mean[0], 
+                          SAEKM_mean[1], SAEKM_mean[2]) )    
+    print >> sys.stderr, ('DCN    avg. NMI = {0:.2f}, ARI = {1:.2f}, ACC = {2:.2f}'.format(DCN_mean[0], 
+                          DCN_mean[1], DCN_mean[2]) )   
+    
+    color  = ['b', 'g', 'r']
+    marker = ['o', '+', '*']
+    x = numpy.linspace(0, config['training_epochs'], num = config['training_epochs']/5 +1)    
+    plt.figure(3)
+    plt.xlabel('Epochs') 
+    for i in range(3):
+        y = res_metrics[:][:,i]        
+        plt.plot(x, y, '-'+color[i]+marker[i], linewidth = 2)    
+    plt.show()        
+    plt.legend(['NMI', 'ARI', 'ACC'])
         
