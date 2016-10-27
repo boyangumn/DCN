@@ -1,64 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sun Apr 24 14:27:50 2016
-
 @author: bo
 
 Multiple-layers Deep Clustering
-
-06/19/2016 Multi-layer autoencoder, without reconstruction, performance is not good, as expected.
-
-06/20/2016 Multi-layer autoencoder, with reconstruction and clustering as loss, seems to give meaningful result on MNIST
-
-06/21/2016 Modified cost output, so that the functions print out cost for both reconstruction and clustering, 
-            added an input lbd, to enable tuning parameter that balancing the two costs--not an easy job.
-
-06/29/2016 Changed how learning-rate (stepsize, both pretraining and finetuning) and center_array are passed and manipulated
-           by using shared-variable mechanism in Theano. Now the stepsize is diminishing c/sqrt(t), where c is some fixed constant            
+         
 """
 
 import os
 import sys
 import timeit
-
+import scipy
 import numpy 
 import cPickle
 import gzip
 import theano
 import theano.tensor as T
-import scipy.io as sio
-from theano.tensor.shared_randomstreams import RandomStreams
-from theano.ifelse import ifelse
-from cluster_acc import acc
-from mnist_loader import MNIST
- 
-from sklearn import metrics
-from sklearn.cluster import MiniBatchKMeans
-from sklearn.cluster import KMeans
-
 import matplotlib.pyplot as plt
-from utils import tile_raster_images
-#from multi_layer_rbm import load_all_data
 
-#from logistic_sgd import LogisticRegression
-#from mlp import HiddenLayer
+from theano.tensor.shared_randomstreams import RandomStreams
+from cluster_acc import acc 
+from sklearn import metrics
+from sklearn.cluster import KMeans
 from dA import dA
-from deepclustering import load_data
-from mlp import HiddenLayer
 
-try:
-    import PIL.Image as Image
-except ImportError:
-    import Image
-    
-#theano.config.compute_test_value = 'warn'
-
-# class dA2 inherited from dA, with loss function modified to norm-square loss
-
-
-def sigmoid(x):
-    return 1/(1 + numpy.exp(-x))
-    
 class dA2(dA):
     # overload the original function in dA class
     # using the ReLU nonlinearity
@@ -76,16 +40,11 @@ class dA2(dA):
         beta = None
     ):
         """
-        Initialize the dA class by specifying the number of visible units (the
+        Initialize the dA2 class by specifying the number of visible units (the
         dimension d of the input ), the number of hidden units ( the dimension
         d' of the latent or hidden space ) and the corruption level. The
         constructor also receives symbolic variables for the input, weights and
-        bias. Such a symbolic variables are useful when, for example the input
-        is the result of some computations, or when weights are shared between
-        the dA and an MLP layer. When dealing with SdAs this always happens,
-        the dA on layer 2 gets as input the output of the dA on layer 1,
-        and the weights of the dA are used in the second stage of training
-        to construct an MLP.
+        bias. 
 
         :type numpy_rng: numpy.random.RandomState
         :param numpy_rng: number random generator used to generate weights
@@ -118,15 +77,16 @@ class dA2(dA):
         :param bvis: Theano variable pointing to a set of biases values (for
                      visible units) that should be shared belong dA and another
                      architecture; if dA should be standalone set this to None
-
+                    
+        :type gamma: theano.tensor.TensorType
+        :param gamma: Tensor variable for implementing batch normalization
+        
+        :type beta: theano.tensor.TensorType
+        :param beta: Tensor variable for implementing batch normalization
 
         """
         self.n_visible = n_visible
         self.n_hidden = n_hidden
-#        self.gamma = theano.shared(value = numpy.ones((n_hidden,), 
-#                                                  dtype=theano.config.floatX), name='gamma')
-#        self.beta = theano.shared(value = numpy.zeros((n_hidden,), 
-#                                                dtype=theano.config.floatX), name='beta')
 
         # create a Theano random generator that gives symbolic random values
         if not theano_rng:
@@ -134,19 +94,7 @@ class dA2(dA):
 
         # note : W' was written as `W_prime` and b' as `b_prime`
         if W is None:
-            # W is initialized with `initial_W` which is uniformely sampled
-            # from -4*sqrt(6./(n_visible+n_hidden)) and
-            # 4*sqrt(6./(n_hidden+n_visible))the output of uniform if
-            # converted using asarray to dtype
-            # theano.config.floatX so that the code is runable on GPU
-#            initial_W = numpy.asarray(
-#                numpy_rng.uniform(
-#                    low=-4 * numpy.sqrt(6. / (n_hidden + n_visible)),
-#                    high=4 * numpy.sqrt(6. / (n_hidden + n_visible)),
-#                    size=(n_visible, n_hidden)
-#                ),
-#                dtype=theano.config.floatX
-#            )
+            
             initial_W = numpy.asarray(
                 0.01*numpy.float32(numpy.random.randn(n_visible, n_hidden))               
                 
@@ -212,22 +160,15 @@ class dA2(dA):
             self.x = T.dmatrix(name='input')
         else:
             self.x = input
-
-#        self.gamma = theano.shared(value = numpy.ones((n_hidden,), dtype=theano.config.floatX), name='gamma')
-#        self.beta = theano.shared(value = numpy.zeros((n_hidden,), dtype=theano.config.floatX), name='beta')
                 
         self.params = [self.W, self.b, self.b_prime, self.gamma, self.beta]
+        # delta is a temporary variable for implementing the momentum method
         self.delta = [theano.shared(value = numpy.zeros((n_visible, n_hidden), dtype = theano.config.floatX), borrow=True), 
                        theano.shared(value = numpy.zeros(n_hidden,  dtype = theano.config.floatX), borrow = True ),
                         theano.shared(value = numpy.zeros(n_visible,  dtype = theano.config.floatX), borrow = True ),
                         theano.shared(value = numpy.zeros(n_hidden,  dtype = theano.config.floatX), borrow = True ),
                         theano.shared(value = numpy.zeros(n_hidden,  dtype = theano.config.floatX), borrow = True )
-                     ]
-        
-#        self.linear = T.dot(input, self.W) + self.b
-#        self.bn_output = T.nnet.bn.batch_normalization(inputs = self.linear,
-#			gamma = self.gamma, beta = self.beta, mean = self.linear.mean((0,), keepdims=True),
-#			std = T.ones_like(self.linear.var((0,), keepdims = True)), mode='high_mem')
+                     ]        
         
     def get_hidden_values(self, input):
         """ Computes the values of the hidden layer """
@@ -252,10 +193,6 @@ class dA2(dA):
         tilde_x = self.get_corrupted_input(self.x, corruption_level)
         y = self.get_hidden_values(tilde_x)
         z = self.get_reconstructed_input(y)
-        # note : we sum over the size of a datapoint; if we are using
-        #        minibatches, L will be a vector, with one entry per
-        #        example in minibatch
-#        L = - T.sum(self.x * T.log(z) + (1 - self.x) * T.log(1 - z), axis=1)
         
         L = T.sum(T.pow(self.x - z, 2), axis = 1)                
         cost = T.mean(L)
@@ -265,23 +202,22 @@ class dA2(dA):
         gparams = T.grad(cost, self.params)
         # generate the list of updates
         updates = []
-#        grad_values = []
-#        param_norm = []
         for param, delta, gparam in zip(self.params, self.delta, gparams):
             updates.append( (delta, mu*delta - learning_rate * gparam) )
             updates.append( (param, param + mu*mu*delta - (1+mu)*learning_rate*gparam ))
-#            grad_values.append(gparam.norm(L=2))
-#            param_norm.append(param.norm(L=2))
-        
-#        updates = [
-#            (param, param - learning_rate * gparam)
-#            for param, gparam in zip(self.params, gparams)
-#        ]
 
-        return (cost, updates)        
-        
-# class SdC, main class for deep-clustering        
+        return (cost, updates)                
+   
 class SdC(object):
+    """
+    
+    class SdC, main class for deep-clustering network, constructed by stacking multiple dA2 layers.
+    
+    It is possilbe to initialize the network with a saved network trained before, just pass the network parameters 
+    to Param_init. This facilites parameter tuning for the optimization part, by avoiding performing pre-training
+    every time.
+     
+    """
     
     def __init__(
         self,
@@ -368,17 +304,13 @@ class SdC(object):
         # note : we sum over the size of a datapoint; if we are using
         #        minibatches, L will be a vector, withd one entry per
         #        example in minibatch
-        # Using least-squares loss for both clustering 
-        # No reconstruction cost in this version
         network_output = self.get_output()
         temp = T.pow(center - network_output, 2)    
         
         L =  T.sum(temp, axis=1) 
         # Add the network reconstruction error 
         z = self.get_network_reconst()
-        reconst_err = T.sum(T.pow(self.x - z, 2), axis = 1)     
-#        reconst_err = - T.sum(self.x * T.log(z) + (1 - self.x) * T.log(1 - z), axis=1)
-        
+        reconst_err = T.sum(T.pow(self.x - z, 2), axis = 1)            
         L = self.beta*L + self.lbd*reconst_err
         
         cost1 = T.mean(L)
@@ -398,8 +330,6 @@ class SdC(object):
             grad_values.append(gparam.norm(L=2))
             param_norm.append(param.norm(L=2))
         
-#        grad_mean = T.mean(grad_values)
-#        param_mean = T.mean(param_norm)
         grad_ = T.stack(*grad_values)
         param_ = T.stack(*param_norm)
         return ((cost1, cost2, cost3, grad_, param_), updates)
@@ -418,10 +348,10 @@ class SdC(object):
 
         :type batch_size: int
         :param batch_size: size of a [mini]batch
+        
+        :type mu: float
+        :param mu: extrapolation parameter used for implementing Nesterov-type acceleration
 
-        :type learning_rate: float
-        :param learning_rate: learning rate used during training for any of
-                              the dA layers
         '''
 
         # index to a [mini]batch
@@ -433,13 +363,6 @@ class SdC(object):
         # ending of a batch given `index`
         batch_end = batch_begin + batch_size
         
-#        if T.gt(batch_end, train_set_x.shape[0]):
-#            batch_end = train_set_x.shape[0]
-#        a,b = T.scalars('a','b')      
-#        z_ifelse = ifelse(T.lt(a, b), a, b)
-#        end_ifelse = theano.function([a,b], z_ifelse, mode=theano.Mode(linker='vm'))
-#        batch_end = end_ifelse(batch_begin + batch_size, train_set_x.shape[0])
-
         pretrain_fns = []
         for dA in self.dA_layers:
             # get the cost and the updates list
@@ -476,28 +399,23 @@ class SdC(object):
                          `valid`, `test` in this order, where each pair
                          is formed of two Theano variables, one for the
                          datapoints, the other for the labels
+                         
+        :type centers: numpy ndarray
+        :param centers: the centroids corresponding to each data sample in the minibatch        
 
         :type batch_size: int
         :param batch_size: size of a minibatch
+        
+        :type mu: float
+        :param mu: extrapolation parameter used for implementing Nesterov-type acceleration
 
         :type learning_rate: float
         :param learning_rate: learning rate used during finetune stage
         
-        ONLY TRAINGING IS IMPLEMENTED, VALIDATION AND TESTING TO BE ADDED...
         '''
 
         (train_set_x, train_set_y) = datasets[0]
-#        (valid_set_x, valid_set_y) = datasets[1]
-#        (test_set_x, test_set_y)   = datasets[2]
         
-#        center= T.matrix('center')
-        
-        # compute number of minibatches for training, validation and testing
-#        n_valid_batches = valid_set_x.get_value(borrow=True).shape[0]
-#        n_valid_batches /= batch_size
-#        n_test_batches = test_set_x.get_value(borrow=True).shape[0]
-#        n_test_batches /= batch_size
-
         index = T.lscalar('index')  # index to a [mini]batch
         minibatch = T.fmatrix('minibatch')
 
@@ -510,14 +428,7 @@ class SdC(object):
         minibatch = train_set_x[
                     index * batch_size: (index + 1) * batch_size
                 ]
-#        if T.le((index + 1) * batch_size, train_set_x.shape[0]):
-#            minibatch = train_set_x[
-#                    index * batch_size: (index + 1) * batch_size
-#                ]
-#        else:
-#            minibatch = minibatch = train_set_x[
-#                    index * batch_size: -1
-#                ]
+
         train_fn = theano.function(
             inputs=[index],
             outputs= cost,
@@ -527,212 +438,62 @@ class SdC(object):
             },
             name='train'
         )
-        return train_fn       
+        return train_fn  
 
-def load_mnist(dataset, batch_size):
-#    datapath = '/home/bo/Data/infimnist/'
-#    path_img = datapath + 'mnist500k-images-idx1-ubyte'
-#    path_lbl = datapath + 'mnist500k-labels-idx1-ubyte'
-#    train_x, train_y = MNIST.load(path_img, path_lbl)
+def load_data(dataset):
+    """
     
+    Load the dataset, perform shuffling
+    
+    """
     with gzip.open(dataset, 'rb') as f:
-        train, test, valid = cPickle.load(f)
-    train_x = numpy.concatenate((train[0], test[0], valid[0]), axis = 0)
-    train_y = numpy.concatenate((train[1], test[1], valid[1]), axis = 0)
+        train_x, train_y = cPickle.load(f)
+    if scipy.sparse.issparse(train_x):
+        train_x = train_x.toarray()
+    if train_x.dtype != 'float32':
+        train_x = train_x.astype(numpy.float32)
+    if train_y.dtype != 'int32':
+        train_y = train_y.astype(numpy.int32)
     
-    N = train_x.shape[0] - train_x.shape[0] % batch_size
-    train_x = train_x[0: N]
-    train_y = train_y[0: N]
-    
-    data_x, data_y = shared_dataset((train_x, train_y))    
-    rval = [(data_x, data_y), 0, 0]
-    return rval   
-
-def load_rcv(dataset, batch_size):    
-    with gzip.open(dataset, 'rb') as f:
-        data = cPickle.load(f)
-    
-    train_x = numpy.float32(data[0].toarray())
-    train_x = train_x.astype(numpy.float32)
-    train_y = numpy.asarray(data[1], dtype = numpy.int32)
-    train_y = numpy.reshape(train_y, (train_y.shape[0], 1))
-    
-    # take out the largest cluster, it is too large, imbalance.
-#    ind = numpy.squeeze(train_y != 4)
-#    train_x = train_x[ind]
-#    train_y = train_y[ind]
-    # shuffle the data
-#    dim = train_x.shape[1]
-#    data = numpy.concatenate((train_x, train_y), axis = 1)
-#    numpy.random.shuffle(data)    
-    # Top-4: take only the first 178600 data sample
-    # Top-8: take only the first 267400 data sample
-    N = train_x.shape[0] - train_x.shape[0] % batch_size
-    train_x = train_x[0:N]
-    train_y = train_y[0:N]
+    if train_y.ndim > 1:
+        train_y = numpy.squeeze(train_y)  
+    N = train_x.shape[0]
     idx = numpy.random.permutation(N)
     train_x = train_x[idx]
     train_y = train_y[idx]
+    
+    return train_x, train_y    
         
-#    train_x = data[0: N][:, 0:dim]
-#    train_y = numpy.int32(numpy.squeeze(data[0: N][:, -1]))  
-    
-    data_x, data_y = shared_dataset((train_x, train_y))
-    
-    rval = [(data_x, data_y), 0, 0]
-    return rval
+def load_data_shared(dataset, batch_size):
+    """
 
-def load_pendigits(dataset, batch_size):
+    Load the dataset and save it as shared-variable to be used by Theano
+    
+    """
     with gzip.open(dataset, 'rb') as f:
-        data = cPickle.load(f)
-        
-    train_x = data[0].astype(numpy.float32)
-    train_y = data[1]
+        train_x, train_y = cPickle.load(f)
     N = train_x.shape[0] - train_x.shape[0] % batch_size
-    train_x = train_x[0:N]
-    train_y = train_y[0:N]
+    train_x = train_x[0: N]    
+    train_y = train_y[0: N]
     
-    data_x, data_y = shared_dataset((train_x, train_y))
-    
-    rval = [(data_x, data_y), 0, 0]
-    return rval  
-
-def load_ssc(dataset, batch_size):
-    data = sio.loadmat(dataset)
-#    train_x = (data['train_x'].T).astype(numpy.float32)
-#    train_y = numpy.squeeze(data['train_y'])
-    train_x = data['kerN'].astype(numpy.float32)
-    train_y = numpy.squeeze(data['MNIST_LABEL'])
-    Nt = train_x.shape[0]
-    N = Nt- numpy.mod(Nt, batch_size)    
-    train_x = train_x[0:N]
-    train_y = train_y[0:N]
-    
-    # normalize 
-    train_x = train_x - numpy.min(train_x)
-    train_x = train_x/numpy.max(train_x)
-    
-    data_x, data_y = shared_dataset((train_x, train_y))
-    # The value 0 won't be used, just use as a placeholder
-    rval = [(data_x, data_y), 0, 0]
-    return rval
-    
-def load_20(dataset, batch_size):
-    data = sio.loadmat(dataset)
-    train_x = (data['fea_t'].toarray()).astype(numpy.float32)
-    train_y = numpy.squeeze(data['gnd'].astype(numpy.int32))
-    Nt = train_x.shape[0]
-    N = Nt - numpy.mod(Nt, batch_size)    
-    train_x = train_x[0:N]
-    train_x = train_x/numpy.max(train_x)
-    train_y = train_y[0:N]
-    
-    # shuffle
-    idx = numpy.random.choice(N, size = N, replace = False)
-    train_x = train_x[idx]
+    # shuffling
+    idx = numpy.random.permutation(N)
+    train_x = train_x[idx]    
     train_y = train_y[idx]
     
-    data_x, data_y = shared_dataset((train_x, train_y))
-    # The value 0 won't be used, just use as a placeholder
+    # change sparse matrix into full, to be compatible with CUDA and Theano
+    if scipy.sparse.issparse(train_x):
+        train_x = train_x.toarray()
+    if train_x.dtype != 'float32':
+        train_x = train_x.astype(numpy.float32)
+    if train_y.dtype != 'int32':
+        train_y = train_y.astype(numpy.int32)
+    if train_y.ndim > 1:
+        train_y = numpy.squeeze(train_y)        
+    
+    data_x, data_y = shared_dataset((train_x, train_y))    
     rval = [(data_x, data_y), 0, 0]
-    return rval
-    
-def load_all_data(dataset, batch_size):
-    ''' Loads the dataset
-
-    :type dataset: string
-    :param dataset: the path to the dataset (here MNIST)
-    '''
-
-    #############
-    # LOAD DATA #
-    #############
-
-    # Download the MNIST dataset if it is not present
-    data_dir, data_file = os.path.split(dataset)
-    if data_dir == "" and not os.path.isfile(dataset):
-        # Check if dataset is in the data directory.
-        new_path = os.path.join(
-            os.path.split(__file__)[0],
-            dataset
-        )
-        if os.path.isfile(new_path) or data_file == 'mnist.pkl.gz':
-            dataset = new_path
-
-    if (not os.path.isfile(dataset)) and data_file == 'mnist.pkl.gz':
-        import urllib
-        origin = (
-            'http://www.iro.umontreal.ca/~lisa/deep/data/mnist/mnist.pkl.gz'
-        )
-        print 'Downloading data from %s' % origin
-        urllib.urlretrieve(origin, dataset)
-
-    print '... loading data'
-    loaded_data = sio.loadmat(dataset)
-    train_x = loaded_data['train_x']
-    train_x = numpy.float32(train_x).T    
-    train_y = numpy.squeeze(loaded_data['train_y'])
-
-    # Load the dataset
-#    f = gzip.open(dataset, 'rb')
-#    train_set, valid_set, test_set = cPickle.load(f)
-#    f.close
-#    train_x = numpy.concatenate((train_set[0], test_set[0], valid_set[0]), axis = 0)   
-#    train_y = numpy.concatenate((train_set[1], test_set[1], valid_set[1]), axis = 0)   
-#    train_x = train_x[:][:, 49:650]
-    
-#    S = numpy.linalg.svd(train_x, compute_uv = 1)    
-    
-## detecting the required rank to preserve 95% energy, the result is 427    
-#    aa = numpy.cumsum(S)
-#    bb = numpy.sum(S)
-#    for j in range(len(aa)):
-#        if aa[j]/bb > 0.95:
-#            break
-    
-# use only two clusters in the testest
-    data_set = test_set
-    N = 4000
-    idx = numpy.logical_or((data_set[1] == 1 ),  (data_set[1] == 0 ))
-    idx = numpy.logical_or(idx, (data_set[1] == 2 ))    
-    idx = numpy.logical_or(idx, (data_set[1] == 3 ))
-        
-    
-#    data_set = test_set
-#    N = 4000
-#    idx = numpy.logical_or((data_set[1] == 1 ),  (data_set[1] == 0 ))
-#    idx = numpy.logical_or(idx, (data_set[1] == 2 ))    
-#    idx = numpy.logical_or(idx, (data_set[1] == 3 ))
-#        
-#    
-#    train_x = data_set[0][idx]
-#    train_y = data_set[1][idx]
-    
-    N = 70000 - numpy.mod(70000, batch_size)    
-    train_x = train_x[0:N]
-#    train_x -= numpy.mean(train_x, axis = 0)
-    train_y = train_y[0:N]
-    
-    # save a copy to perform SC
-#    f = gzip.open('mnist-n4000.pkl.gz','wb')
-#    cPickle.dump([train_x, train_y], f, protocol=2)
-#    f.close()
-#    train_x = 4*train_set[0]
-#    # normalize
-#    train_x = train_x/(numpy.linalg.norm(train_x, ord = 2, axis = 1, keepdims = True) + 1e-10)
-#    train_x = 4*train_x
-#    train_y = train_set[1]
-            
-    data_x, data_y = shared_dataset((train_x, train_y))
-    
-    
-#    test_set_x, test_set_y = shared_dataset(test_set)
-#    valid_set_x, valid_set_y = shared_dataset(valid_set)
-#    train_set_x, train_set_y = shared_dataset(train_set)
-#
-    # The value 0 won't be used, just use as a placeholder
-    rval = [(data_x, data_y), 0, 0]
-    return rval
+    return rval    
     
 def shared_dataset(data_xy, borrow=True):
         """ Function that loads the dataset into shared variables
@@ -774,17 +535,13 @@ def batch_km(data, center, count):
         dist = numpy.inf
         ind = 0
         for j in range(K):
-            temp_dist = numpy.linalg.norm(data[i] - center[j])  
-#            temp_dist = 1 - numpy.dot(data[i], center[j])/(numpy.linalg.norm(data[i]) * numpy.linalg.norm(center[j]))
-#            temp_dist = -numpy.mean(data[i]*logg(center[j]) + (1 - data[i]) * logg(1 - center[j]))
-            
+            temp_dist = numpy.linalg.norm(data[i] - center[j])              
             if temp_dist < dist:
                 dist = temp_dist
                 ind = j
         idx[i] = ind
         
     # update centriod
-#    count = numpy.zeros(K)
     center_new = center
     for i in range(N):
         c = idx[i]
@@ -793,63 +550,72 @@ def batch_km(data, center, count):
         center_new[c] = (1 - eta) * center_new[c] + eta * data[i]
         
     return idx, center_new, count
-    
-def load_config(saved_file):
-    with gzip.open(saved_file, 'rb') as f:
-        saved_result = cPickle.load(f)
-    return saved_result['config']
-        
+  
 def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', beta = 1, finetune_lr= .005, mu = 0.9, pretraining_epochs=50,
              pretrain_lr=.001, training_epochs=150,
-             dataset='toy.pkl.gz', batch_size=20, nClass = 4, hidden_dim = [100, 50, 2], load_dataset = load_data, diminishing = True):
+             dataset='toy.pkl.gz', batch_size=20, nClass = 4, hidden_dim = [100, 50, 2],  diminishing = True):
     """
-    Demonstrates how to train and test a stochastic denoising autoencoder.
-
-    This is demonstrated on MNIST.
-    
+    :type Init: string
+    :param Init: a string contains the filename of a saved network, the saved network can be loaded to initialize 
+                 the network. Leave this parameter be an empty string if no saved network available. If failed to 
+                 find the specified file, the program will initialized the network randomly.
+                 
     :type lbd: float
     :param lbd: tuning parameter, multiplied on reconstruction error, i.e. the larger
                 lbd the larger weight on minimizing reconstruction error.
                 
-    :type learning_rate: float
-    :param learning_rate: learning rate used in the finetune stage
+    :type output_dir: string
+    :param output_dir: the location to save trained network
+    
+    :type save_file: string
+    :param save_file: the filename to save trained network
+    
+    :type beta: float
+    :param beta: the parameter for the clustering term, set to 0 if a pure SAE (without clustering regularization)
+                 is intended.          
+                
+    :type finetune_lr: float
+    :param finetune_lr: learning rate used in the finetune stage
     (factor for the stochastic gradient)
-
+    
+    :type mu: float
+    :param mu: extrapolation parameter used for implementing Nesterov-type acceleration
+    
     :type pretraining_epochs: int
     :param pretraining_epochs: number of epoch to do pretraining
 
     :type pretrain_lr: float
     :param pretrain_lr: learning rate to be used during pre-training
-
-    :type n_iter: int
-    :param n_iter: maximal number of iterations ot run the optimizer
+    
+    :type training_epochs: int
+    :param training_epochs: number of epoch to do optimization
 
     :type dataset: string
-    :param dataset: path the the pickled dataset
-
-    """
+    :param dataset: path of the pickled dataset
     
-#    datasets = load_20(dataset, batch_size)
-#    datasets = load_ssc(dataset, batch_size)
-#    datasets = load_mnist(dataset, batch_size)   
-#    datasets = load_pendigits(dataset, batch_size)
+    :type batch_size: int
+    :param batch_size: number of data samples in one minibatch
     
-#    datasets = load_rcv(dataset, batch_size)
-#    datasets = load_all_data(dataset, batch_size)  
+    :type nClass: int
+    :param nClass: number of clusters
+    
+    :hidden dim: array
+    :param hidden_dim: the number of neurons in each hidden layer in the forward network, the reconstruction part 
+                       has a mirror-image structure
 
-#    datasets = load_data(dataset)  
-    datasets = load_dataset(dataset, batch_size)
+    :type diminishing: boolean
+    :param diminishing: whether or not to reduce learning rate during optimization, if True, the learning rate is 
+                        halfed every 5 epochs.
+    """    
+    datasets = load_data_shared(dataset, batch_size)  
     
     working_dir = os.getcwd()
-    train_set_x,  train_set_y  = datasets[0]
-    
+    train_set_x,  train_set_y  = datasets[0]    
     inDim = train_set_x.get_value().shape[1]
     label_true = numpy.squeeze(numpy.int32(train_set_y.get_value(borrow=True)))
     
     index = T.lscalar() 
     x = T.matrix('x')
-    
-#    x.tag.test_value = numpy.random.rand(50000, 784).astype('float32')
     
     # compute number of minibatches for training, validation and testing
     n_train_samples = train_set_x.get_value(borrow=True).shape[0]
@@ -861,7 +627,11 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
     numpy_rng = numpy.random.RandomState(89677)
 #    numpy_rng = numpy.random.RandomState()
     print '... building the model'
-    os.chdir(output_dir)
+    try:
+        os.chdir(output_dir)
+    except OSError:
+        os.mkdir(output_dir)
+        os.chdir(output_dir)
     # construct the stacked denoising autoencoder class
     if Init == '':
         sdc = SdC(
@@ -897,7 +667,6 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
                     hidden_layers_sizes= hidden_dim
                 )           
         
-    # end-snippet-3 start-snippet-4
     #########################
     # PRETRAINING THE MODEL #
     #########################
@@ -925,7 +694,6 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
                 for batch_index in xrange(n_train_batches):
                     iter = (epoch) * n_train_batches + batch_index 
                     pretrain_lr_shared.set_value( numpy.float32(pretrain_lr) )
-    #                pretrain_lr_shared.set_value( numpy.float32(pretrain_lr/numpy.sqrt(iter + 1)) )
                     cost = pretraining_fns[i](index=batch_index,
                              corruption=corruption_levels[i],
                              lr=pretrain_lr_shared.get_value())                         
@@ -944,7 +712,7 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
         package = {'network': network}            
         with gzip.open('deepclus_'+str(nClass)+ '_pretrain.pkl.gz', 'wb') as f:
             cPickle.dump(package, f, protocol=cPickle.HIGHEST_PROTOCOL)
-    # end-snippet-4
+
     ########################
     # FINETUNING THE MODEL #
     ########################
@@ -958,11 +726,6 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
         outputs = out,
         givens = {x: train_set_x[index * batch_size: (index + 1) * batch_size]}
     )  
-    out_single = theano.function(
-        [index],
-        outputs = out,
-        givens = {x: train_set_x[index].reshape((1, inDim))}
-    ) 
     hidden_val = [] 
     for batch_index in xrange(n_train_batches):
          hidden_val.append(out_sdc(batch_index))
@@ -970,21 +733,14 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
     hidden_array  = numpy.asarray(hidden_val)
     hidden_size = hidden_array.shape        
     hidden_array = numpy.reshape(hidden_array, (hidden_size[0] * hidden_size[1], hidden_size[2] ))
-      
-    # use the true labels to get initial cluster centers
-#    centers = numpy.zeros((nClass, hidden_size[2]), dtype = numpy.float32)
+
     hidden_zero = numpy.zeros_like(hidden_array)
     
     zeros_count = numpy.sum(numpy.equal(hidden_array, hidden_zero), axis = 0)       
     
-#    center_array = centers[label_true]
 #    # Do a k-means clusering to get center_array  
     km_idx = km.fit_predict(hidden_array)
-    centers = km.cluster_centers_.astype(numpy.float32)
-#    for i in xrange(nClass):
-#        temp = hidden_array[km_idx == i]        
-#        centers[i] = numpy.mean(temp, axis = 0)
-#    center_array = km.cluster_centers_[[km.labels_]]             
+    centers = km.cluster_centers_.astype(numpy.float32)     
     center_shared =  theano.shared(numpy.zeros((batch_size, hidden_dim[-1]) ,
                                                    dtype='float32'),
                                      borrow=True)
@@ -1000,28 +756,7 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
         ac = 0
         print('Number of predicted cluster mismatch with ground truth.')
         
-    print >> sys.stderr, ('ACC for deep clustering: %.2f' % (ac))
-    
-    # Plot the initialization    
-#    color = ['b', 'g', 'r', 'm', 'k', 'b', 'g', 'r', 'm', 'k']
-#    marker = ['o', '+','o', '+','o', '+','o', '+','o', '+']
-#    data_to_plot = hidden_array[0:1999]
-#    label_plot = label_true[0:1999]   
-#    labels = numpy.unique(label_true)
-#    
-#    x = data_to_plot[:, 0]
-#    y = data_to_plot[:, 1]
-#    
-#    for i in xrange(nClass):
-#        idx_x = x[numpy.nonzero(label_plot == labels[i])]
-#        idx_y = y[numpy.nonzero(label_plot == labels[i])]   
-#        plt.figure(0)
-#        plt.scatter(idx_x, idx_y, s = 70, c = color[i], marker = marker[i], label = '%s'%i)
-#    
-#    plt.legend()
-#    plt.show() 
-    
-#    km_idx = label_true                                     
+    print >> sys.stderr, ('ACC for deep clustering: %.2f' % (ac))                              
     lr_shared = theano.shared(numpy.asarray(finetune_lr,
                                                    dtype='float32'),
                                      borrow=True)
@@ -1037,7 +772,6 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
     )
 
     print '... finetunning the model'
-    # early-stopping parameters
 
     start_time = timeit.default_timer()
     done_looping = False
@@ -1071,7 +805,6 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
 #                count_samples[i] += temp_idx.shape[0] - numpy.count_nonzero(temp_idx - i)             
 #            center_shared.set_value(numpy.float32(temp_center))
             km_idx[minibatch_index * batch_size: (minibatch_index +1 ) * batch_size] = temp_idx
-            aa = sdc.dA_layers[0].W.get_value()
             c.append(cost[0])
             d.append(cost[1])
             e.append(cost[2])
@@ -1131,16 +864,6 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
         print('Number of predicted cluster mismatch with ground truth.')
         
     print >> sys.stderr, ('ACC for deep clustering: %.2f' % (ac))
-#    print(
-#        (
-#            'Optimization complete with best validation score of %f %%, '
-#            'on iteration %i, '
-#            'with test performance %f %%'
-#        )
-#        % (best_validation_loss * 100., best_iter + 1, test_score * 100.)
-#    )
-    
-    
     
     config = {'lbd': lbd,   
               'beta': beta,
@@ -1165,89 +888,34 @@ def test_SdC(Init = '', lbd = .01, output_dir='MNIST_results', save_file = '', b
     os.chdir(working_dir)    
     print >> sys.stderr, ('The training code for file ' +
                           os.path.split(__file__)[1] +
-                          ' ran for %.2fm' % ((end_time - start_time) / 60.))
-#    color = ['b', 'g', 'r', 'm', 'k', 'b', 'g', 'r', 'm', 'k']
-#    marker = ['o', '+','o', '+','o', '+','o', '+','o', '+']
-#    
-#    #Take 500 samples to plot
-#    data_to_plot = hidden_array[0:1999]
-#    label_plot = label_true[0:1999]   
-#    labels = numpy.unique(label_true)
-#    
-#    x = data_to_plot[:, 0]
-#    y = data_to_plot[:, 1]
-#    
-#    for i in xrange(nClass):
-#        idx_x = x[numpy.nonzero(label_plot == labels[i])]
-#        idx_y = y[numpy.nonzero(label_plot == labels[i])]   
-#        plt.figure(1)
-#        plt.scatter(idx_x, idx_y, s = 70, c = color[i], marker = marker[i], label = '%s'%i)
-#    
-#    plt.legend()
-#    plt.show() 
+                          ' ran for %.2fm' % ((end_time - start_time) / 60.))   
     
-    
-    return res_metrics          
-    
+    return res_metrics             
 
 if __name__ == '__main__':      
-    result = numpy.zeros((5, 3), dtype = numpy.float32)
-
-
-##   for RCV1    
-#    i = 0
-#    filename = 'data-'+str(i)+'.pkl.gz'
-#    K = (i+1)*4
-#    path = '/home/bo/Data/RCV1/Processed/'
-
-##  for MNSIT dataset
+    # run experiment with raw MNIST data
     K = 10
-    filename = 'mnist.pkl.gz'
+    filename = 'mnist_dcn.pkl.gz'
     path = '/home/bo/Data/MNIST/'
-
-
-## for SSC_data
-#    K = 10
-#    filename = 'ssc_sc.mat'
-#    path = ''
-
-
-## for 20-newsgroup
-#    K = 20
-#    filename = 'News_ncw.mat'
-#    path  = ''
-
-## for PenDigits
-#    K = 10
-#    filename = 'pendigits.pkl.gz'
-#    path = ''
     
-    # deepclus_12_clusters.pkl.gz
-    # deepclus_20_pretrain.pkl.gz
     trials = 1
     dataset = path+filename
     config = {'Init': '',
-              'lbd': .5, 
-              'beta': 1, 
-              'output_dir': 'Pendigits',
-              'save_file': 'pen_10.pkl.gz',
-              'pretraining_epochs': 50,
-              'pretrain_lr': .005, 
-              'mu': 0.9,
-              'finetune_lr': 0.01, 
-              'training_epochs': 50,
-              'dataset': dataset, 
-              'batch_size': 20, 
-              'nClass': K, 
-              'hidden_dim': [50, 16, 16],
-              'load_data': load_mnist}
-    # load saved configuration          
-    saved_path = './MNIST_results/Finalized/'
-    saved_file = 'deepclus_10_clusters.pkl.gz'
-    saved_config = load_config(saved_path + saved_file)
-    for key, val in saved_config.iteritems():
-        config[key] = saved_config[key]
-    
+          'lbd': .05, 
+          'beta': 1, 
+          'output_dir': 'MNIST_results',
+          'save_file': 'mnist_10.pkl.gz',
+          'pretraining_epochs': 50,
+          'pretrain_lr': .01, 
+          'mu': 0.9,
+          'finetune_lr': 0.05, 
+          'training_epochs': 50,
+          'dataset': dataset, 
+          'batch_size': 128, 
+          'nClass': K, 
+          'hidden_dim': [2000, 1000, 500, 500, 250, 50],
+          'diminishing': False}
+
     results = []
     for i in range(trials):         
         res_metrics = test_SdC(**config)   
@@ -1278,5 +946,4 @@ if __name__ == '__main__':
         y = res_metrics[:][:,i]        
         plt.plot(x, y, '-'+color[i]+marker[i], linewidth = 2)    
     plt.show()        
-    plt.legend(['NMI', 'ARI', 'ACC'])
-        
+    plt.legend(['NMI', 'ARI', 'ACC'])        
