@@ -28,7 +28,7 @@ Data preparation
 The data file should be named like 'something.pkl.gz', i.e., it should be pickled and compressed by gzip, using python code as follow:
 
 """
-with gizp.open('something.pkl.gz', 'wb') as f:
+with gzip.open('something.pkl.gz', 'wb') as f:
     cPickle.dump([train_x, train_y], f, protocol = 0)
 """
 where train_x and train_y are numpy ndarray with shape
@@ -38,14 +38,14 @@ train_y: (n_samples, )
 The path of data files should be made available to the programs by modifying the 'path' local variable in each of the 'run_' python source files.
 
 ==============================================
-Dependancies
+Dependencies
 
 Theano   
 scikit-learn
 numpy
 scipy
 matplotlib
-Theanon deep leanring tutorial code (can be download from http://deeplearning.net/tutorial/).
+Theanon deep learning tutorial code (can be download from http://deeplearning.net/tutorial/).
 
 
 
